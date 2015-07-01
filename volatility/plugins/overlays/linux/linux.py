@@ -799,7 +799,12 @@ class net_device(obj.CType):
             macaddr = ":".join(["{0:02x}".format(x) for x in hwaddr][:6])
         
         if macaddr == "00:00:00:00:00:00":
-            hwaddr = self.obj_vm.zread(self.dev_addr, 6)
+            if type(self.dev_addr) == volatility.obj.Pointer:
+                addr = self.dev_addr.v()
+            else:
+                addr = self.dev_addr.obj_offset
+    
+            hwaddr = self.obj_vm.zread(addr, 6)
             macaddr = ":".join(["{0:02x}".format(ord(x)) for x in hwaddr][:6])
                         
         return macaddr
@@ -899,6 +904,9 @@ class module_struct(obj.CType):
         return val
 
     def get_params(self):
+        if not hasattr(self, "kp"):
+            return ""
+
         params = ""
         param_array = obj.Object(theType = 'Array', offset = self.kp, vm = self.obj_vm, targetType = 'kernel_param', count = self.num_kp)
         
@@ -1883,8 +1891,10 @@ class task_struct(obj.CType):
         This just figures out which is in use and returns the correct variables
         '''
 
-        wall_addr = self.obj_vm.profile.get_symbol("wall_to_monotonic")
-        sleep_addr = self.obj_vm.profile.get_symbol("total_sleep_time")
+        wall_addr       = self.obj_vm.profile.get_symbol("wall_to_monotonic")
+        sleep_addr      = self.obj_vm.profile.get_symbol("total_sleep_time")
+        timekeeper_addr = self.obj_vm.profile.get_symbol("timekeeper")
+        tkcore_addr     = self.obj_vm.profile.get_symbol("tk_core") 
 
         # old way
         if wall_addr and sleep_addr:
@@ -1896,11 +1906,32 @@ class task_struct(obj.CType):
             timeo = linux_common.vol_timespec(0, 0)
     
         # timekeeper way
-        else:
-            timekeeper_addr = self.obj_vm.profile.get_symbol("timekeeper")
+        elif timekeeper_addr:
             timekeeper = obj.Object("timekeeper", offset = timekeeper_addr, vm = self.obj_vm)
             wall = timekeeper.wall_to_monotonic
             timeo = timekeeper.total_sleep_time
+
+        # 3.17(ish) - 3.19(ish) way
+        elif tkcore_addr and hasattr("timekeeper", "total_sleep_time"):
+            # skip seqcount
+            timekeeper = obj.Object("timekeeper", offset = tkcore_addr + 4, vm = self.obj_vm)
+            wall = timekeeper.wall_to_monotonic
+            timeo = timekeeper.total_sleep_time
+
+        # 3.19(ish)+
+        # getboottime from 3.19.x
+        elif tkcore_addr:
+            # skip seqcount
+            timekeeper = obj.Object("timekeeper", offset = tkcore_addr + 8, vm = self.obj_vm)
+            wall = timekeeper.wall_to_monotonic
+
+            oreal = timekeeper.offs_real
+            oboot = timekeeper.offs_boot
+ 
+            tv64 = (oreal.tv64 & 0xffffffff) - (oboot.tv64 & 0xffffffff)
+
+            tv64 = (tv64 / 100000000) * -1
+            timeo = linux_common.vol_timespec(tv64, 0) 
 
         return (wall, timeo)
 
@@ -1922,22 +1953,27 @@ class task_struct(obj.CType):
             secs = secs - 1
 
         boot_time = secs + (nsecs / linux_common.nsecs_per / 100)
+
         return boot_time
         
     def get_task_start_time(self):
 
-        start_time = self.start_time
-        if type(start_time) == long:
-            start_secs = start_time
-        else: 
-            start_secs = start_time.tv_sec + (start_time.tv_nsec / linux_common.nsecs_per / 100)
+        if hasattr(self, "real_start_time"):
+            start_time = self.real_start_time
+        else:
+            start_time = self.start_time
+
+        if type(start_time) == volatility.obj.NativeType and type(start_time.v()) == long:
+            start_time = linux_common.vol_timespec(start_time.v() / 0x989680 / 100, 0)
+
+        start_secs = start_time.tv_sec + (start_time.tv_nsec / linux_common.nsecs_per / 100)
 
         sec = self.get_boot_time() + start_secs
-                
+               
         # convert the integer as little endian 
         try:
             data = struct.pack("<I", sec)
-        except struct.error:
+        except struct.error, e:
             # in case we exceed 0 <= number <= 4294967295
             return 0
 
@@ -2251,7 +2287,6 @@ class page(obj.CType):
         return phys_offset
 
 class mount(obj.CType):
-
     @property
     def mnt_sb(self):
 
@@ -2283,6 +2318,10 @@ class mount(obj.CType):
         return ret
 
 class vfsmount(obj.CType):
+    def is_valid(self):
+        return self.mnt_sb.is_valid() and \
+               self.mnt_root.is_valid() and \
+               self.mnt_parent.is_valid()
 
     def _get_real_mnt(self):
 
@@ -2318,5 +2357,10 @@ class LinuxMountOverlay(obj.ProfileModification):
 
         if profile.vtypes.get("mount"):
             profile.object_classes.update({'mount' : mount, 'vfsmount' : vfsmount})
+        else:
+            profile.object_classes.update({'vfsmount' : vfsmount})
+
+
+
 
 

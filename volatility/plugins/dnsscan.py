@@ -84,6 +84,7 @@ class DnsScan(common.AbstractWindowsCommand):
                 continue
             seen.add(hostname)
 
+            hostname = "".join([c for c in hostname if c in valid_chars])
             yield address - size + start, hostname
 
     def calculate(self):
